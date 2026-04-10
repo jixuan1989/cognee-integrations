@@ -9,6 +9,20 @@ OpenClaw plugin that adds Cognee-backed memory with automatic recall and indexin
 - **CLI commands**: `openclaw cognee index` to manually sync, `openclaw cognee status` to check state
 - **Configurable**: Search type, max results, score filtering, token limits, and more
 
+## Differences From Original
+
+Compared with the original single-dataset Cognee memory plugin, this version adds several behavior and operational changes:
+
+- **Per-agent dataset isolation**: `datasetName` supports `{agentId}` templates such as `openclaw-{agentId}`, so different agents use separate Cognee datasets and separate sync index files.
+- **Shared memory dataset**: Optional `sharedDatasetName` lets recall merge results from the current agent's private dataset and one shared dataset.
+- **Shared write tool**: When `sharedDatasetName` is configured, the plugin registers `cognee_memory_share` so agents can explicitly write facts into the shared memory space.
+- **OpenClaw memory runtime integration**: In addition to lifecycle hooks, the plugin registers a memory runtime/search manager so it behaves more like a native OpenClaw memory backend.
+- **Safer config/env separation**: Environment variable resolution was moved into `config.ts` so the network module does not directly combine `process.env` access with HTTP calls, reducing false-positive security warnings during install.
+- **Local Ollama-focused compose**: `cognee-docker-compose.yaml` is tuned for local Ollama usage, disables Cognee API authentication by default to avoid local 401 errors, and applies a tokenizer patch on container startup.
+- **Extra tooling and docs**: This version includes helper scripts for starting Ollama + Cognee and manually writing memory, plus Chinese docs for API key alignment and multi-agent/shared-memory configuration.
+
+If you keep `datasetName` as a plain string without `{agentId}` and do not set `sharedDatasetName`, the plugin remains backward compatible with the original single-dataset workflow.
+
 ## Security / Install Warning
 
 When installing, OpenClaw may show:
