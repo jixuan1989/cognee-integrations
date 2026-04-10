@@ -9,6 +9,16 @@ OpenClaw plugin that adds Cognee-backed memory with automatic recall and indexin
 - **CLI commands**: `openclaw cognee index` to manually sync, `openclaw cognee status` to check state
 - **Configurable**: Search type, max results, score filtering, token limits, and more
 
+## Security / Install Warning
+
+When installing, OpenClaw may show:
+
+```text
+WARNING: Plugin "cognee-openclaw" contains dangerous code patterns: Environment variable access combined with network send — possible credential harvesting
+```
+
+This is a **false positive**. The plugin reads `COGNEE_API_KEY` (or the configured API key) only to send it to **your own Cognee server** at the URL you set in `baseUrl` (default `http://localhost:8000`). It does not send credentials to any third-party or fixed external server. Environment variable access is isolated in `config.js` and network calls use only the resolved config; the scanner heuristically flags any plugin that both reads env and uses fetch in the same package.
+
 ## Installation
 
 Install the plugin locally for development:
@@ -33,7 +43,7 @@ Enable the plugin in your OpenClaw config (`~/.openclaw/config.yaml` or project 
 ```yaml
 plugins:
   entries:
-    memory-cognee:
+    cognee-openclaw:
       enabled: true
       config:
         baseUrl: "http://localhost:8000"
@@ -57,7 +67,8 @@ export COGNEE_API_KEY="your-key-here"
 |--------|------|---------|-------------|
 | `baseUrl` | string | `http://localhost:8000` | Cognee API base URL |
 | `apiKey` | string | `$COGNEE_API_KEY` | API key for authentication |
-| `datasetName` | string | `openclaw` | Dataset name for storing memories |
+| `datasetName` | string | `openclaw` | Dataset name; use `{agentId}` for per-agent (e.g. `openclaw-{agentId}`) |
+| `sharedDatasetName` | string | _(none)_ | Optional shared dataset; recall searches private + shared; agents can write via `cognee_memory_share` tool |
 | `searchType` | string | `GRAPH_COMPLETION` | Search mode: `GRAPH_COMPLETION`, `CHUNKS`, `SUMMARIES` |
 | `maxResults` | number | `6` | Max memories to inject per recall |
 | `minScore` | number | `0` | Minimum relevance score filter |
@@ -66,6 +77,26 @@ export COGNEE_API_KEY="your-key-here"
 | `autoIndex` | boolean | `true` | Sync memory files on startup and after agent runs |
 | `autoCognify` | boolean | `true` | Run cognify after new memories are added |
 | `requestTimeoutMs` | number | `60000` | HTTP timeout for Cognee requests |
+
+## One-shot: Ollama + Cognee
+
+From the repo root, start both Ollama and Cognee (Docker) with one script:
+
+```bash
+# Optional: set LLM key for Cognee, or put it in .env
+export LLM_API_KEY="your-key-if-needed"
+
+./scripts/start-ollama-cognee.sh        # start both
+./scripts/start-ollama-cognee.sh --check   # status only
+```
+
+See `scripts/start-ollama-cognee.sh` for details and `cognee-docker-compose.yaml` for Cognee.
+
+## Per-agent and shared memory
+
+- **Per-agent**: Set `datasetName` to a template with `{agentId}`, e.g. `openclaw-{agentId}`. Each agent (main, techmaster, etc.) gets its own Cognee dataset and its own sync index file (`sync-index-<agentId>.json`). Agents cannot see each other’s private memories.
+- **Shared**: Set `sharedDatasetName` (e.g. `openclaw-shared`). Recall searches both the agent’s private dataset and the shared dataset and merges results. Agents can write to the shared dataset via the **`cognee_memory_share`** tool (saves a piece of text into shared memory).
+- **Backward compatible**: If `datasetName` does not contain `{agentId}`, behavior is unchanged (single dataset and single `sync-index.json`).
 
 ## How It Works
 

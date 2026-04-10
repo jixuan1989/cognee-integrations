@@ -3,26 +3,17 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import {
+  isPerAgentDataset,
+  resolveConfig,
+  resolveDatasetName,
+  type CogneePluginConfig,
+  type CogneeSearchType,
+} from "./config.js";
 
 // ---------------------------------------------------------------------------
-// Types
+// Types (config types live in config.ts to isolate env access from network code)
 // ---------------------------------------------------------------------------
-
-type CogneeSearchType = "GRAPH_COMPLETION" | "CHUNKS" | "SUMMARIES";
-
-type CogneePluginConfig = {
-  baseUrl?: string;
-  apiKey?: string;
-  datasetName?: string;
-  searchType?: CogneeSearchType;
-  maxResults?: number;
-  minScore?: number;
-  maxTokens?: number;
-  autoRecall?: boolean;
-  autoIndex?: boolean;
-  autoCognify?: boolean;
-  requestTimeoutMs?: number;
-};
 
 type CogneeAddResponse = {
   dataset_id: string;
@@ -84,8 +75,14 @@ const DEFAULT_AUTO_INDEX = true;
 const DEFAULT_AUTO_COGNIFY = true;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
-const STATE_PATH = join(homedir(), ".openclaw", "memory", "cognee", "datasets.json");
-const SYNC_INDEX_PATH = join(homedir(), ".openclaw", "memory", "cognee", "sync-index.json");
+const COGNEE_MEMORY_DIR = join(homedir(), ".openclaw", "memory", "cognee");
+const STATE_PATH = join(COGNEE_MEMORY_DIR, "datasets.json");
+
+function getSyncIndexPath(agentId: string | undefined): string {
+  return agentId != null
+    ? join(COGNEE_MEMORY_DIR, `sync-index-${agentId}.json`)
+    : join(COGNEE_MEMORY_DIR, "sync-index.json");
+}
 
 /** Glob patterns for memory files, relative to workspace root. */
 const MEMORY_FILE_PATTERNS = ["MEMORY.md", "memory.md", "memory"];
@@ -94,62 +91,8 @@ const MEMORY_FILE_PATTERNS = ["MEMORY.md", "memory.md", "memory"];
 // Helpers
 // ---------------------------------------------------------------------------
 
-function resolveEnvVars(value: string): string {
-  return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
-    const envValue = process.env[envVar];
-    if (!envValue) {
-      throw new Error(`Environment variable ${envVar} is not set`);
-    }
-    return envValue;
-  });
-}
-
 function hashText(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> {
-  const raw =
-    rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
-      ? (rawConfig as CogneePluginConfig)
-      : {};
-
-  const baseUrl = raw.baseUrl?.trim() || DEFAULT_BASE_URL;
-  const datasetName = raw.datasetName?.trim() || DEFAULT_DATASET_NAME;
-  const searchType = raw.searchType || DEFAULT_SEARCH_TYPE;
-  const maxResults =
-    typeof raw.maxResults === "number" ? raw.maxResults : DEFAULT_MAX_RESULTS;
-  const minScore =
-    typeof raw.minScore === "number" ? raw.minScore : DEFAULT_MIN_SCORE;
-  const maxTokens =
-    typeof raw.maxTokens === "number" ? raw.maxTokens : DEFAULT_MAX_TOKENS;
-  const autoRecall =
-    typeof raw.autoRecall === "boolean" ? raw.autoRecall : DEFAULT_AUTO_RECALL;
-  const autoIndex =
-    typeof raw.autoIndex === "boolean" ? raw.autoIndex : DEFAULT_AUTO_INDEX;
-  const autoCognify =
-    typeof raw.autoCognify === "boolean" ? raw.autoCognify : DEFAULT_AUTO_COGNIFY;
-  const requestTimeoutMs =
-    typeof raw.requestTimeoutMs === "number" ? raw.requestTimeoutMs : DEFAULT_REQUEST_TIMEOUT_MS;
-
-  const apiKey =
-    raw.apiKey && raw.apiKey.length > 0
-      ? resolveEnvVars(raw.apiKey)
-      : process.env.COGNEE_API_KEY || "";
-
-  return {
-    baseUrl,
-    apiKey,
-    datasetName,
-    searchType,
-    maxResults,
-    minScore,
-    maxTokens,
-    autoRecall,
-    autoIndex,
-    autoCognify,
-    requestTimeoutMs,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +116,10 @@ async function saveDatasetState(state: DatasetState): Promise<void> {
   await fs.writeFile(STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
 }
 
-async function loadSyncIndex(): Promise<SyncIndex> {
+async function loadSyncIndex(agentId: string | undefined): Promise<SyncIndex> {
+  const path = getSyncIndexPath(agentId);
   try {
-    const raw = await fs.readFile(SYNC_INDEX_PATH, "utf-8");
+    const raw = await fs.readFile(path, "utf-8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") {
       return { entries: {} };
@@ -191,9 +135,28 @@ async function loadSyncIndex(): Promise<SyncIndex> {
   }
 }
 
-async function saveSyncIndex(state: SyncIndex): Promise<void> {
-  await fs.mkdir(dirname(SYNC_INDEX_PATH), { recursive: true });
-  await fs.writeFile(SYNC_INDEX_PATH, JSON.stringify(state, null, 2), "utf-8");
+async function saveSyncIndex(state: SyncIndex, agentId: string | undefined): Promise<void> {
+  const path = getSyncIndexPath(agentId);
+  await fs.mkdir(dirname(path), { recursive: true });
+  await fs.writeFile(path, JSON.stringify(state, null, 2), "utf-8");
+}
+
+/** Extract agentId from hook/CLI context. Session key format: agent:<agentId>:... */
+function getAgentIdFromCtx(ctx: { agentId?: string; sessionKey?: string; workspaceDir?: string }): string {
+  if (ctx.agentId) return ctx.agentId;
+  const sk = ctx.sessionKey;
+  if (typeof sk === "string" && sk.startsWith("agent:")) {
+    const parts = sk.split(":");
+    if (parts.length >= 2) return parts[1];
+  }
+  const wd = ctx.workspaceDir;
+  if (typeof wd === "string") {
+    const base = basename(wd);
+    if (base.startsWith("workspace-")) return base.slice("workspace-".length);
+    const agentsMatch = wd.match(/[/\\]agents[/\\]([^/\\]+)([/\\]|$)/);
+    if (agentsMatch) return agentsMatch[1];
+  }
+  return "main";
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +261,11 @@ class CogneeClient {
     data: string;
     datasetName: string;
     datasetId?: string;
+    filename?: string;
   }): Promise<{ datasetId: string; datasetName: string; dataId?: string }> {
     const formData = new FormData();
-    formData.append("data", new Blob([params.data], { type: "text/plain" }), "openclaw-memory.txt");
+    const filename = params.filename?.trim() || "openclaw-memory.txt";
+    formData.append("data", new Blob([params.data], { type: "text/plain" }), filename);
     formData.append("datasetName", params.datasetName);
     if (params.datasetId) {
       formData.append("datasetId", params.datasetId);
@@ -368,7 +333,7 @@ class CogneeClient {
         "Content-Type": "application/json",
         ...this.buildHeaders(),
       },
-      body: JSON.stringify({ datasetIds: params.datasetIds }),
+      body: JSON.stringify({ datasets: params.datasetIds, runInBackground: true, chunksPerBatch: 10 }),
     });
   }
 
@@ -377,6 +342,7 @@ class CogneeClient {
     searchType: CogneeSearchType;
     datasetIds: string[];
     maxTokens: number;
+    maxResults?: number;
   }): Promise<CogneeSearchResult[]> {
     const data = await this.fetchJson<unknown>("/api/v1/search", {
       method: "POST",
@@ -388,7 +354,9 @@ class CogneeClient {
         query: params.queryText,
         searchType: params.searchType,
         datasetIds: params.datasetIds,
-        max_tokens: params.maxTokens,
+        topK: params.maxResults ?? 6,
+        onlyContext: false,
+        verbose: true,
       }),
     });
 
@@ -463,6 +431,8 @@ async function syncFiles(
   syncIndex: SyncIndex,
   cfg: Required<CogneePluginConfig>,
   logger: { info?: (msg: string) => void; warn?: (msg: string) => void },
+  effectiveDatasetName: string,
+  agentId: string | undefined,
 ): Promise<SyncResult & { datasetId?: string }> {
   const result: SyncResult = { added: 0, updated: 0, skipped: 0, errors: 0 };
   let datasetId = syncIndex.datasetId;
@@ -491,7 +461,7 @@ async function syncFiles(
 
           syncIndex.entries[file.path] = { hash: file.hash, dataId: existing.dataId };
           syncIndex.datasetId = datasetId;
-          syncIndex.datasetName = cfg.datasetName;
+          syncIndex.datasetName = effectiveDatasetName;
           result.updated++;
 
           logger.info?.(`memory-cognee: updated ${file.path}`);
@@ -510,18 +480,20 @@ async function syncFiles(
       }
 
       // New file, or changed file without dataId, or update failed → add
+      const safeFilename = file.path.replace(/[\\/]/g, "__") || "openclaw-memory.txt";
       const response = await client.add({
         data: dataWithMetadata,
-        datasetName: cfg.datasetName,
+        datasetName: effectiveDatasetName,
         datasetId,
+        filename: safeFilename,
       });
 
       if (response.datasetId && response.datasetId !== datasetId) {
         datasetId = response.datasetId;
 
-        // Persist dataset ID mapping
+        // Persist dataset ID mapping (global state: all dataset names -> id)
         const state = await loadDatasetState();
-        state[cfg.datasetName] = response.datasetId;
+        state[effectiveDatasetName] = response.datasetId;
         await saveDatasetState(state);
       }
 
@@ -530,7 +502,7 @@ async function syncFiles(
         dataId: response.dataId,
       };
       syncIndex.datasetId = datasetId;
-      syncIndex.datasetName = cfg.datasetName;
+      syncIndex.datasetName = effectiveDatasetName;
       needsCognify = true;
       result.added++;
 
@@ -551,8 +523,8 @@ async function syncFiles(
     }
   }
 
-  // Save sync index to disk
-  await saveSyncIndex(syncIndex);
+  // Save sync index to disk (per-agent or legacy path)
+  await saveSyncIndex(syncIndex, agentId);
 
   return { ...result, datasetId };
 }
@@ -562,43 +534,36 @@ async function syncFiles(
 // ---------------------------------------------------------------------------
 
 const memoryCogneePlugin = {
-  id: "memory-cognee",
+  id: "cognee-openclaw",
   name: "Memory (Cognee)",
   description: "Cognee-backed memory: indexes workspace memory files, auto-recalls before agent runs",
   kind: "memory" as const,
   register(api: OpenClawPluginApi) {
     const cfg = resolveConfig(api.pluginConfig);
     const client = new CogneeClient(cfg.baseUrl, cfg.apiKey, cfg.requestTimeoutMs);
-    let datasetId: string | undefined;
-    let syncIndex: SyncIndex = { entries: {} };
-    let syncIndexReady = false;
-    let resolvedWorkspaceDir: string | undefined;  // Set by service/CLI, used by hooks
+    /** Global dataset name -> datasetId (persisted in datasets.json) */
+    let datasetState: DatasetState = {};
+    let resolvedWorkspaceDir: string | undefined;
 
-    // Load persisted state on startup
-    const stateReady = Promise.all([
-      loadDatasetState()
-        .then((state) => {
-          datasetId = state[cfg.datasetName];
-        })
-        .catch((error) => {
-          api.logger.warn?.(`memory-cognee: failed to load dataset state: ${String(error)}`);
-        }),
-      loadSyncIndex()
-        .then((state) => {
-          syncIndex = state;
-          syncIndexReady = true;
-          if (!datasetId && state.datasetId && state.datasetName === cfg.datasetName) {
-            datasetId = state.datasetId;
-          }
-        })
-        .catch((error) => {
-          api.logger.warn?.(`memory-cognee: failed to load sync index: ${String(error)}`);
-        }),
-    ]);
+    const stateReady = loadDatasetState()
+      .then((state) => {
+        datasetState = state;
+      })
+      .catch((error) => {
+        api.logger.warn?.(`memory-cognee: failed to load dataset state: ${String(error)}`);
+      });
 
-    // Helper: run sync with a given workspace dir
-    async function runSync(workspaceDir: string, logger: { info?: (msg: string) => void; warn?: (msg: string) => void }) {
+    const perAgent = isPerAgentDataset(cfg.datasetName);
+
+    async function runSync(
+      workspaceDir: string,
+      logger: { info?: (msg: string) => void; warn?: (msg: string) => void },
+      agentId?: string,
+    ): Promise<SyncResult> {
       await stateReady;
+
+      const effectiveAgentId = perAgent ? (agentId ?? "main") : undefined;
+      const effectiveDatasetName = resolveDatasetName(cfg.datasetName, agentId ?? "main");
 
       const files = await collectMemoryFiles(workspaceDir);
       if (files.length === 0) {
@@ -608,13 +573,155 @@ const memoryCogneePlugin = {
 
       logger.info?.(`memory-cognee: found ${files.length} memory file(s), syncing...`);
 
-      const result = await syncFiles(client, files, syncIndex, cfg, logger);
+      const syncIndex = await loadSyncIndex(effectiveAgentId);
+      const result = await syncFiles(
+        client,
+        files,
+        syncIndex,
+        cfg,
+        logger,
+        effectiveDatasetName,
+        effectiveAgentId,
+      );
       if (result.datasetId) {
-        datasetId = result.datasetId;
+        datasetState[effectiveDatasetName] = result.datasetId;
       }
 
       return result;
     }
+
+    function extractPathFromText(text: string): string {
+      const match = text.match(/^Path:\s*(.+)$/m);
+      if (match?.[1]) return match[1].trim();
+      return "cognee-memory";
+    }
+
+    function buildCogneeSearchManager(agentId: string, workspaceDir: string) {
+      const effectiveDatasetName = resolveDatasetName(cfg.datasetName, agentId);
+      const effectiveAgentId = perAgent ? agentId : undefined;
+
+      return {
+        status() {
+          return {
+            backend: "builtin" as const,
+            provider: "cognee-openclaw",
+            model: cfg.searchType,
+            workspaceDir,
+            files: 0,
+            chunks: 0,
+            dirty: false,
+            sources: ["memory" as const],
+            extraPaths: [COGNEE_MEMORY_DIR],
+          };
+        },
+        async probeEmbeddingAvailability() {
+          try {
+            const response = await fetch(`${cfg.baseUrl}/health`);
+            if (!response.ok) {
+              return { ok: false, error: `Cognee health check failed (${response.status})` };
+            }
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) };
+          }
+        },
+        async probeVectorAvailability() {
+          try {
+            const response = await fetch(`${cfg.baseUrl}/api/v1/datasets`, {
+              headers: client["buildHeaders"](),
+            });
+            if (!response.ok) {
+              return { ok: false, error: `Cognee datasets probe failed (${response.status})` };
+            }
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : String(error) };
+          }
+        },
+        async search(query: string, opts?: { maxResults?: number; signal?: AbortSignal }) {
+          await stateReady;
+          const privateId = datasetState[effectiveDatasetName];
+          const sharedId = cfg.sharedDatasetName ? datasetState[cfg.sharedDatasetName] : undefined;
+          const datasetIds = [privateId, sharedId].filter(Boolean) as string[];
+          if (datasetIds.length === 0) return [];
+
+          const results = await client.search({
+            queryText: query,
+            searchType: cfg.searchType,
+            datasetIds,
+            maxTokens: cfg.maxTokens,
+            maxResults: opts?.maxResults ?? cfg.maxResults,
+          });
+
+          return results
+            .filter((r) => r.score >= cfg.minScore)
+            .slice(0, opts?.maxResults ?? cfg.maxResults)
+            .map((r, index) => {
+              const relPath = extractPathFromText(r.text);
+              const lines = r.text.split(/\r?\n/);
+              return {
+                path: relPath,
+                startLine: 1,
+                endLine: Math.max(1, lines.length),
+                snippet: r.text,
+                score: r.score,
+                source: "memory" as const,
+                metadata: { id: r.id, ...(r.metadata ?? {}), rank: index + 1 },
+              };
+            });
+        },
+        async readFile(params: { relPath: string; from?: number; lines?: number }) {
+          const absPath = resolve(workspaceDir, params.relPath);
+          try {
+            const content = await fs.readFile(absPath, "utf-8");
+            const allLines = content.split(/\r?\n/);
+            const from = Math.max(1, params.from ?? 1);
+            const maxLines = Math.max(1, params.lines ?? allLines.length);
+            const slice = allLines.slice(from - 1, from - 1 + maxLines);
+            return {
+              relPath: params.relPath,
+              from,
+              lines: slice.length,
+              content: slice.join("\n"),
+            };
+          } catch {
+            return null;
+          }
+        },
+        async close() {
+          return;
+        },
+      };
+    }
+
+    api.logger.info?.(`memory-cognee: registerMemoryRuntime available=${typeof (api as any).registerMemoryRuntime === "function"}`);
+    (api as any).registerMemoryRuntime?.({
+      getMemorySearchManager(params) {
+        const ctxAgentId = params.agentId ?? getAgentIdFromCtx({
+          agentId: params.agentId,
+          sessionKey: params.sessionKey,
+          workspaceDir: params.workspaceDir,
+        });
+        const ctxWorkspaceDir = params.workspaceDir || resolvedWorkspaceDir || process.cwd();
+        return buildCogneeSearchManager(ctxAgentId, ctxWorkspaceDir);
+      },
+      resolveMemoryBackendConfig(params) {
+        const slot = params.config?.plugins?.slots?.memory;
+        const entry = params.config?.plugins?.entries?.["cognee-openclaw"];
+        if (slot !== "cognee-openclaw" || entry?.enabled === false) {
+          return null;
+        }
+        return {
+          backend: "builtin" as const,
+          provider: "cognee-openclaw",
+          model: cfg.searchType,
+          requestedProvider: "cognee-openclaw",
+        };
+      },
+      async closeAllMemorySearchManagers() {
+        return;
+      },
+    });
 
     // ------------------------------------------------------------------
     // CLI: openclaw cognee index / openclaw cognee status
@@ -623,12 +730,15 @@ const memoryCogneePlugin = {
     api.registerCli((ctx) => {
       const cognee = ctx.program.command("cognee").description("Cognee memory management");
       const resolvedWorkspaceDir = ctx.workspaceDir || process.cwd();
+      const cliAgentId = getAgentIdFromCtx(ctx);
 
       cognee
         .command("index")
         .description("Sync memory files to Cognee (add new, update changed, skip unchanged)")
-        .action(async () => {
-          const result = await runSync(resolvedWorkspaceDir, ctx.logger);
+        .option("--agent <id>", "Agent id (per-agent mode; default from context or main)", cliAgentId)
+        .action(async (opts: { agent?: string }) => {
+          const agentId = opts.agent ?? cliAgentId;
+          const result = await runSync(resolvedWorkspaceDir, ctx.logger, agentId);
           const summary = `Sync complete: ${result.added} added, ${result.updated} updated, ${result.skipped} unchanged, ${result.errors} errors`;
           ctx.logger.info?.(summary);
           console.log(summary);
@@ -637,8 +747,15 @@ const memoryCogneePlugin = {
       cognee
         .command("status")
         .description("Show Cognee sync state (files indexed, dataset info)")
-        .action(async () => {
+        .option("--agent <id>", "Agent id (per-agent mode)", cliAgentId)
+        .action(async (opts: { agent?: string }) => {
           await stateReady;
+
+          const agentId = opts.agent ?? cliAgentId;
+          const effectiveAgentId = perAgent ? agentId : undefined;
+          const effectiveDatasetName = resolveDatasetName(cfg.datasetName, agentId);
+          const syncIndex = await loadSyncIndex(effectiveAgentId);
+          const datasetId = datasetState[effectiveDatasetName] ?? syncIndex.datasetId;
 
           const entryCount = Object.keys(syncIndex.entries).length;
           const entriesWithDataId = Object.values(syncIndex.entries).filter((e) => e.dataId).length;
@@ -656,14 +773,15 @@ const memoryCogneePlugin = {
           }
 
           const lines = [
-            `Dataset: ${syncIndex.datasetName ?? cfg.datasetName}`,
-            `Dataset ID: ${datasetId ?? syncIndex.datasetId ?? "(not set)"}`,
+            perAgent ? `Agent: ${agentId}` : "",
+            `Dataset: ${effectiveDatasetName}`,
+            `Dataset ID: ${datasetId ?? "(not set)"}`,
             `Indexed files: ${entryCount} (${entriesWithDataId} with data ID)`,
             `Workspace files: ${files.length}`,
             `New (unindexed): ${newCount}`,
             `Changed (dirty): ${dirty}`,
-            `Sync index: ${SYNC_INDEX_PATH}`,
-          ];
+            `Sync index: ${getSyncIndexPath(effectiveAgentId)}`,
+          ].filter(Boolean);
           console.log(lines.join("\n"));
         });
     }, { commands: ["cognee"] });
@@ -676,11 +794,11 @@ const memoryCogneePlugin = {
       api.registerService({
         id: "cognee-auto-sync",
         async start(ctx) {
-          // Store workspace dir for use in hooks
           resolvedWorkspaceDir = ctx.workspaceDir || process.cwd();
+          const agentId = getAgentIdFromCtx(ctx as { workspaceDir?: string; sessionKey?: string; agentId?: string });
 
           try {
-            const result = await runSync(resolvedWorkspaceDir, ctx.logger);
+            const result = await runSync(resolvedWorkspaceDir, ctx.logger, agentId);
             ctx.logger.info?.(
               `memory-cognee: auto-sync complete: ${result.added} added, ${result.updated} updated, ${result.skipped} unchanged`,
             );
@@ -697,15 +815,21 @@ const memoryCogneePlugin = {
 
     if (cfg.autoRecall) {
       api.on("before_agent_start", async (event, ctx) => {
-        // Wait for state to load (fixes race condition on first agent run)
         await stateReady;
 
         if (!event.prompt || event.prompt.length < 5) {
           api.logger.debug?.("memory-cognee: skipping recall (prompt too short)");
           return;
         }
-        if (!datasetId) {
-          api.logger.debug?.("memory-cognee: skipping recall (no datasetId)");
+
+        const agentId = getAgentIdFromCtx(ctx as { agentId?: string; sessionKey?: string; workspaceDir?: string });
+        const effectiveDatasetName = resolveDatasetName(cfg.datasetName, agentId);
+        const privateId = datasetState[effectiveDatasetName];
+        const sharedId = cfg.sharedDatasetName ? datasetState[cfg.sharedDatasetName] : undefined;
+        const datasetIds = [privateId, sharedId].filter(Boolean) as string[];
+
+        if (datasetIds.length === 0) {
+          api.logger.debug?.("memory-cognee: skipping recall (no datasetId for private or shared)");
           return;
         }
 
@@ -713,12 +837,14 @@ const memoryCogneePlugin = {
           const results = await client.search({
             queryText: event.prompt,
             searchType: cfg.searchType,
-            datasetIds: [datasetId],
+            datasetIds,
             maxTokens: cfg.maxTokens,
+            maxResults: cfg.maxResults,
           });
 
           const filtered = results
-            .filter((result) => result.score >= cfg.minScore)
+            .filter((r) => r.score >= cfg.minScore)
+            .sort((a, b) => b.score - a.score)
             .slice(0, cfg.maxResults);
 
           if (filtered.length === 0) {
@@ -727,11 +853,11 @@ const memoryCogneePlugin = {
           }
 
           const payload = JSON.stringify(
-            filtered.map((result) => ({
-              id: result.id,
-              score: result.score,
-              text: result.text,
-              metadata: result.metadata,
+            filtered.map((r) => ({
+              id: r.id,
+              score: r.score,
+              text: r.text,
+              metadata: r.metadata,
             })),
             null,
             2,
@@ -756,16 +882,16 @@ const memoryCogneePlugin = {
 
     if (cfg.autoIndex) {
       api.on("agent_end", async (event, ctx) => {
-        // Only sync if the agent succeeded
         if (!event.success) return;
 
         await stateReady;
 
-        // Need workspace dir to find memory files
         const workspaceDir = resolvedWorkspaceDir || process.cwd();
+        const agentId = getAgentIdFromCtx(ctx as { agentId?: string; sessionKey?: string; workspaceDir?: string });
+        const effectiveAgentId = perAgent ? agentId : undefined;
 
         try {
-          // Collect current files and find changed ones
+          const syncIndex = await loadSyncIndex(effectiveAgentId);
           const files = await collectMemoryFiles(workspaceDir);
           const changedFiles = files.filter((f) => {
             const existing = syncIndex.entries[f.path];
@@ -776,9 +902,18 @@ const memoryCogneePlugin = {
 
           api.logger.info?.(`memory-cognee: detected ${changedFiles.length} changed file(s), syncing...`);
 
-          const result = await syncFiles(client, changedFiles, syncIndex, cfg, api.logger);
+          const effectiveDatasetName = resolveDatasetName(cfg.datasetName, agentId);
+          const result = await syncFiles(
+            client,
+            changedFiles,
+            syncIndex,
+            cfg,
+            api.logger,
+            effectiveDatasetName,
+            effectiveAgentId,
+          );
           if (result.datasetId) {
-            datasetId = result.datasetId;
+            datasetState[effectiveDatasetName] = result.datasetId;
           }
 
           api.logger.info?.(
@@ -788,6 +923,67 @@ const memoryCogneePlugin = {
           api.logger.warn?.(`memory-cognee: post-agent sync failed: ${String(error)}`);
         }
       });
+    }
+
+    // ------------------------------------------------------------------
+    // Tool: write to shared dataset (when sharedDatasetName is set)
+    // ------------------------------------------------------------------
+
+    if (cfg.sharedDatasetName) {
+      api.registerTool(
+        {
+          name: "cognee_memory_share",
+          label: "Cognee Shared Memory",
+          description:
+            "Save a piece of information into the shared Cognee memory dataset. Use for facts or preferences that should be available to all agents.",
+          parameters: {
+            type: "object",
+            properties: {
+              text: { type: "string", description: "Content to remember in shared memory" },
+            },
+            required: ["text"],
+          },
+          async execute(_toolCallId, params) {
+            const text = (params as { text: string }).text?.trim();
+            if (!text) {
+              return {
+                content: [{ type: "text" as const, text: "Provide non-empty text to store." }],
+                details: { error: "missing_text" },
+              };
+            }
+
+            await stateReady;
+
+            try {
+              const sharedId = datasetState[cfg.sharedDatasetName];
+              const uniqueFilename = `shared-memory-${Date.now()}.txt`;
+              const response = await client.add({
+                data: text,
+                datasetName: cfg.sharedDatasetName,
+                datasetId: sharedId,
+                filename: uniqueFilename,
+              });
+              if (response.datasetId) {
+                datasetState[cfg.sharedDatasetName] = response.datasetId;
+                await saveDatasetState(datasetState).catch(() => {});
+              }
+              if (cfg.autoCognify && response.datasetId) {
+                await client.cognify({ datasetIds: [response.datasetId] }).catch(() => {});
+              }
+              return {
+                content: [{ type: "text" as const, text: `Stored in shared memory: "${text.slice(0, 80)}${text.length > 80 ? "…" : ""}"` }],
+                details: { action: "created", datasetName: cfg.sharedDatasetName },
+              };
+            } catch (error) {
+              return {
+                content: [{ type: "text" as const, text: `Failed to store: ${error instanceof Error ? error.message : String(error)}` }],
+                details: { error: String(error) },
+              };
+            }
+          },
+        },
+        { name: "cognee_memory_share" },
+      );
     }
   },
 };

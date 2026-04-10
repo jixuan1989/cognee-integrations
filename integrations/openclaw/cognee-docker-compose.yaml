@@ -11,19 +11,41 @@ services:
     image: cognee/cognee:latest
     container_name: cognee
     ports:
-      - "127.0.0.1:8000:8000"
+      - "8001:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      - LLM_API_KEY=${LLM_API_KEY}
+      # 关闭 API 鉴权，避免插件请求返回 401（与插件 apiKey 对齐见 doc/cognee-openclaw-api-key.md）
+      - REQUIRE_AUTHENTICATION=false
       - ENABLE_BACKEND_ACCESS_CONTROL=false
+      - LLM_PROVIDER=ollama
+      - LLM_MODEL=qwen3:8b
+      - LLM_ENDPOINT=http://host.docker.internal:11434/v1
+      - COGNEE_SKIP_CONNECTION_TEST=true
+      - LLM_API_KEY=ollama
+      - LLM_MAX_TOKENS=16384
+      - LLM_CONTEXT_WINDOW=128000
+      - EMBEDDING_PROVIDER=ollama
+      - EMBEDDING_MODEL=nomic-embed-text
+      - EMBEDDING_DIMENSIONS=768
+      - EMBEDDING_ENDPOINT=http://host.docker.internal:11434/api/embed
+      - TOKENIZER_MODE=tiktoken
+      - HUGGINGFACE_TOKENIZER=none
+      - CHUNK_SIZE=1024
+      - CHUNK_OVERLAP=128
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
+      - DB_PROVIDER=sqlite
+      - VECTOR_DB_PROVIDER=lancedb
+      - GRAPH_DATABASE_PROVIDER=kuzu
+      - TELEMETRY_ENABLED=false
+      - HOST=0.0.0.0
+      - PORT=8000
+    entrypoint: ["/bin/sh", "-c", "python3 /patches/patch-ollama-tokenizer.py && exec /app/entrypoint.sh"]
     volumes:
       - cognee_data:/app/cognee/.cognee_system
+      - ./patch-ollama-tokenizer.py:/patches/patch-ollama-tokenizer.py:ro
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
 
 volumes:
   cognee_data:

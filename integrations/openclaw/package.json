@@ -19,7 +19,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist/tests/**/*.test.js"
   },
   "peerDependencies": {
     "openclaw": ">=2026.2.3-1"

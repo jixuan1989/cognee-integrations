@@ -1,5 +1,5 @@
 {
-  "id": "memory-cognee",
+  "id": "cognee-openclaw",
   "name": "Memory (Cognee)",
   "kind": "memory",
   "configSchema": {
@@ -16,7 +16,11 @@
       },
       "datasetName": {
         "type": "string",
-        "description": "Cognee dataset name to store memories in"
+        "description": "Cognee dataset name; use {agentId} for per-agent (e.g. openclaw-{agentId})"
+      },
+      "sharedDatasetName": {
+        "type": "string",
+        "description": "Optional shared dataset; search merges private+shared; agents can write via cognee_memory_share tool"
       },
       "searchType": {
         "type": "string",
@@ -69,7 +73,11 @@
     },
     "datasetName": {
       "label": "Dataset Name",
-      "placeholder": "openclaw"
+      "placeholder": "openclaw or openclaw-{agentId}"
+    },
+    "sharedDatasetName": {
+      "label": "Shared Dataset",
+      "placeholder": "openclaw-shared"
     },
     "searchType": {
       "label": "Search Type",
