@@ -58,6 +58,31 @@
       "requestTimeoutMs": {
         "type": "number",
         "description": "HTTP timeout in milliseconds for Cognee requests (default: 60000)"
+      },
+      "dreaming": {
+        "type": "object",
+        "description": "Memory dreaming configuration (light/deep/REM phases)",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "frequency": { "type": "string" },
+          "timezone": { "type": "string" },
+          "verboseLogging": { "type": "boolean" },
+          "storage": {
+            "type": "object",
+            "properties": {
+              "mode": { "type": "string" },
+              "separateReports": { "type": "boolean" }
+            }
+          },
+          "phases": {
+            "type": "object",
+            "properties": {
+              "light": { "type": "object" },
+              "deep": { "type": "object" },
+              "rem": { "type": "object" }
+            }
+          }
+        }
       }
     }
   },
